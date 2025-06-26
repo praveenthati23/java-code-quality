@@ -46,54 +46,79 @@ jobs:
           PMD_VIOLATIONS=0
           PMD_FILES=0
           SPOTBUGS_BUGS=0
+          CHECKSTYLE_DETAILS=""
+          PMD_DETAILS=""
+          SPOTBUGS_DETAILS=""
 
           # Parse Checkstyle
           if [ -f target/checkstyle-result.xml ]; then
             CHECKSTYLE_VIOLATIONS=$(xmllint --xpath 'count(//file/error)' target/checkstyle-result.xml || echo 0)
+            while IFS= read -r file; do
+              file_path=$(echo "$file" | sed -n 's/.*name="\([^"]*\)".*/\1/p')
+              count=$(echo "$file" | grep -o "<error" | wc -l)
+              if [ "$count" -gt 0 ]; then
+                CHECKSTYLE_DETAILS+="- \`${file_path#$GITHUB_WORKSPACE/}`\` – $count violations\n"
+              fi
+            done < <(xmllint --xpath '//file' target/checkstyle-result.xml 2>/dev/null | tr '\n' ' ' | sed 's/></>\n</g')
           fi
 
           # Parse PMD
           if [ -f target/pmd.xml ]; then
             PMD_VIOLATIONS=$(grep -c '<violation' target/pmd.xml || true)
             PMD_FILES=$(grep -c '<file' target/pmd.xml || true)
+            while IFS= read -r line; do
+              file_path=$(echo "$line" | sed -n 's/.*<file name="\([^"]*\)".*/\1/p')
+              count=$(echo "$line" | grep -o "<violation" | wc -l)
+              if [ "$count" -gt 0 ]; then
+                PMD_DETAILS+="- \`${file_path#$GITHUB_WORKSPACE/}`\` – $count violations\n"
+              fi
+            done < <(awk '/<file /{printf "%s", $0; next} /<\/file>/{print; next} {printf "%s", $0}' target/pmd.xml)
           fi
 
           # Parse SpotBugs
           if [ -f target/spotbugsXml.xml ]; then
             SPOTBUGS_BUGS=$(grep -o -E "total_bugs=['\"]?[0-9]+['\"]?" target/spotbugsXml.xml | head -1 | sed -E 's/[^0-9]//g')
             [ -z "$SPOTBUGS_BUGS" ] && SPOTBUGS_BUGS=0
+            while IFS= read -r line; do
+              path=$(echo "$line" | grep -o 'path="[^"]*"' | cut -d'"' -f2)
+              bugs=$(echo "$line" | grep -o 'bugCount="[0-9]*"' | cut -d'"' -f2)
+              if [ "$bugs" -gt 0 ]; then
+                SPOTBUGS_DETAILS+="- \`${path}`\` – $bugs bugs\n"
+              fi
+            done < <(grep -o 'FileStats [^>]*' target/spotbugsXml.xml)
           fi
 
-          # Build comment summary
+          # Markdown Summary
           SUMMARY="## 🧹 Code Quality Report\n\n"
 
           SUMMARY+="### ✅ Checkstyle:\n"
           if [ "$CHECKSTYLE_VIOLATIONS" -eq "0" ]; then
             SUMMARY+="✅ No style violations found\n\n"
           else
-            SUMMARY+="❌ $CHECKSTYLE_VIOLATIONS violations found\n\n"
+            SUMMARY+="❌ $CHECKSTYLE_VIOLATIONS violations found\n$CHECKSTYLE_DETAILS\n"
           fi
 
           SUMMARY+="### ✅ PMD:\n"
           if [ "$PMD_VIOLATIONS" -eq "0" ]; then
             SUMMARY+="✅ No violations found\n\n"
           else
-            SUMMARY+="❌ $PMD_VIOLATIONS violations in $PMD_FILES files\n\n"
+            SUMMARY+="❌ $PMD_VIOLATIONS violations in $PMD_FILES files\n$PMD_DETAILS\n"
           fi
 
           SUMMARY+="### ✅ SpotBugs:\n"
           if [ "$SPOTBUGS_BUGS" -eq "0" ]; then
             SUMMARY+="✅ No bugs found\n\n"
           else
-            SUMMARY+="❌ $SPOTBUGS_BUGS bugs found\n\n"
+            SUMMARY+="❌ $SPOTBUGS_BUGS bugs found\n$SPOTBUGS_DETAILS\n"
           fi
 
-          REPORT_LINK="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-          SUMMARY+="📥 [View Full Reports]($REPORT_LINK)\n\n"
+          SUMMARY+="📥 [View Full Reports](https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)\n\n"
 
-          echo "summary<<EOF" >> $GITHUB_OUTPUT
-          echo "$SUMMARY" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          # Escape for GitHub output
+          SUMMARY="${SUMMARY//'%'/'%25'}"
+          SUMMARY="${SUMMARY//$'\n'/'%0A'}"
+          SUMMARY="${SUMMARY//$'\r'/'%0D'}"
+          echo "summary=$SUMMARY" >> $GITHUB_OUTPUT
 
       - name: Upload Checkstyle Report
         if: always()

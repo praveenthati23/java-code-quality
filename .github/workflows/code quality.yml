@@ -4,17 +4,18 @@ on:
   pull_request:
     branches:
       - dev
+  workflow_dispatch:  # Optional: trigger manually
 
 jobs:
   code-quality:
-    name: Analyze Code (PMD, SpotBugs, Checkstyle)
+    name: Run PMD, SpotBugs, and Checkstyle
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
       contents: read
 
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up JDK 17
@@ -23,65 +24,58 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Cache Maven packages
+      - name: Cache Maven dependencies
         uses: actions/cache@v4
         with:
           path: ~/.m2/repository
           key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            ${{ runner.os }}-maven-
+          restore-keys: ${{ runner.os }}-maven-
 
-      - name: Run Checkstyle, PMD, SpotBugs
-        run: |
-          mvn --batch-mode clean verify
-          mvn checkstyle:checkstyle
+      - name: Run Code Analysis Tools
+        run: mvn clean verify site
 
-      - name: Install xmllint
+      - name: Install xmllint (for parsing XML)
         run: sudo apt-get install -y libxml2-utils
 
       - name: Extract analysis summaries
         id: analysis-summary
         run: |
-          CHECKSTYLE_VIOLATIONS=0
           PMD_VIOLATIONS=0
           PMD_FILES=0
           SPOTBUGS_BUGS=0
+          CHECKSTYLE_VIOLATIONS=0
 
-          # Parse Checkstyle
-          if [ -f target/checkstyle-result.xml ]; then
-            CHECKSTYLE_VIOLATIONS=$(xmllint --xpath 'count(//file/error)' target/checkstyle-result.xml || echo 0)
-          fi
-
-          # Parse PMD
           if [ -f target/pmd.xml ]; then
             PMD_VIOLATIONS=$(grep -c '<violation' target/pmd.xml || true)
             PMD_FILES=$(grep -c '<file' target/pmd.xml || true)
           fi
 
-          # Parse SpotBugs
           if [ -f target/spotbugsXml.xml ]; then
             SPOTBUGS_BUGS=$(grep -o -E "total_bugs=['\"]?[0-9]+['\"]?" target/spotbugsXml.xml | head -1 | sed -E 's/[^0-9]//g')
             [ -z "$SPOTBUGS_BUGS" ] && SPOTBUGS_BUGS=0
           fi
 
-          # Build comment summary
-          SUMMARY="## 🧹 Code Quality Report\n\n"
+          if [ -f target/checkstyle-result.xml ]; then
+            CHECKSTYLE_VIOLATIONS=$(grep -c '<error' target/checkstyle-result.xml || true)
+          fi
 
-          SUMMARY+="### ✅ Checkstyle:\n"
+          SUMMARY="## 🧹 Code Analysis Report\n\n"
+
+          SUMMARY+="### 🔧 Checkstyle\n"
           if [ "$CHECKSTYLE_VIOLATIONS" -eq "0" ]; then
-            SUMMARY+="✅ No style violations found\n\n"
+            SUMMARY+="✅ No violations found\n\n"
           else
             SUMMARY+="❌ $CHECKSTYLE_VIOLATIONS violations found\n\n"
           fi
 
-          SUMMARY+="### ✅ PMD:\n"
+          SUMMARY+="### 🐛 PMD\n"
           if [ "$PMD_VIOLATIONS" -eq "0" ]; then
             SUMMARY+="✅ No violations found\n\n"
           else
             SUMMARY+="❌ $PMD_VIOLATIONS violations in $PMD_FILES files\n\n"
           fi
 
-          SUMMARY+="### ✅ SpotBugs:\n"
+          SUMMARY+="### 🐞 SpotBugs\n"
           if [ "$SPOTBUGS_BUGS" -eq "0" ]; then
             SUMMARY+="✅ No bugs found\n\n"
           else
@@ -89,32 +83,77 @@ jobs:
           fi
 
           REPORT_LINK="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-          SUMMARY+="📥 [View Full Reports]($REPORT_LINK)\n\n"
+          SUMMARY+="📥 [Download Full Reports]($REPORT_LINK)\n\n"
 
-          echo "summary<<EOF" >> $GITHUB_OUTPUT
-          echo "$SUMMARY" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          if [ "$CHECKSTYLE_VIOLATIONS" -gt "0" ]; then
+            SUMMARY+="<details><summary>🔧 Checkstyle Violation Breakdown</summary>\n\n"
+            awk -F'"' '/<file name=/ {file=$2} /<error / {print "`"file" - "$4"`"}' target/checkstyle-result.xml | sort | uniq >> temp_checkstyle.txt
+            while IFS= read -r line; do
+              SUMMARY+="$line\n"
+            done < temp_checkstyle.txt
+            rm -f temp_checkstyle.txt
+            SUMMARY+="</details>\n\n"
+          fi
 
-      - name: Upload Checkstyle Report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: checkstyle-report
-          path: target/checkstyle-result.xml
+          if [ "$PMD_VIOLATIONS" -gt "0" ]; then
+            SUMMARY+="<details><summary>🐛 PMD Violation Breakdown</summary>\n\n"
+            while IFS= read -r file_line; do
+              file_path=$(echo "$file_line" | sed -n 's/.*<file name="\([^"]*\)".*/\1/p')
+              clean_path="${file_path#$GITHUB_WORKSPACE/}"
+              violation_count=$(grep -c "<violation" <<< "$file_line" || echo "0")
+              if [ "$violation_count" -gt 0 ]; then
+                SUMMARY+="\`${clean_path} - ${violation_count} violations\`\n"
+              fi
+            done < <(awk '/<file /{printf "%s", $0; next} /<\/file>/{print; next} {printf "%s", $0}' target/pmd.xml)
+            SUMMARY+="</details>\n\n"
+          fi
 
-      - name: Upload PMD report
+          if [ "$SPOTBUGS_BUGS" -gt "0" ]; then
+            SUMMARY+="<details><summary>🐞 SpotBugs Bug Breakdown</summary>\n\n"
+            while IFS= read -r line; do
+              path="${line#*path=}"
+              path="${path%% *}"
+              path="${path#\'}"
+              path="${path%\'}"
+              path="${path#\"}"
+              path="${path%\"}"
+              bugCount="${line#*bugCount=}"
+              bugCount="${bugCount%% *}"
+              bugCount="${bugCount#\'}"
+              bugCount="${bugCount%\'}"
+              bugCount="${bugCount#\"}"
+              bugCount="${bugCount%\"}"
+              if [ -n "$path" ] && [ -n "$bugCount" ]; then
+                SUMMARY+="\`${path} - ${bugCount} bugs\`\n"
+              fi
+            done < <(grep -o "FileStats [^>]*" target/spotbugsXml.xml)
+            SUMMARY+="</details>\n\n"
+          fi
+
+          SUMMARY="${SUMMARY//\`/\\\`}"
+          echo "summary=$SUMMARY" >> $GITHUB_OUTPUT
+          echo "$SUMMARY"
+
+      - name: Upload PMD report (HTML)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: pmd-report
           path: target/site/
 
-      - name: Upload SpotBugs report
+      - name: Upload SpotBugs report (HTML)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: spotbugs-report
           path: target/spotbugs.html
+
+      - name: Upload Checkstyle report (XML)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkstyle-report
+          path: target/checkstyle-result.xml
 
       - name: Post or update PR comment
         if: always() && github.event_name == 'pull_request'
@@ -122,34 +161,42 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const summary = `${{ steps.analysis-summary.outputs.summary }}`;
-            const { issue: { number: issueNumber }, repo: { owner, repo } } = context;
-            const COMMENT_TAG = 'Code Quality Report';
-            const fullBody = `${COMMENT_TAG}\n\n${summary}\n\n<sub>🤖 Generated by GitHub Actions</sub>`;
+            try {
+              const summary = `${{ steps.analysis-summary.outputs.summary }}`;
+              const { issue: { number: issueNumber }, repo: { owner, repo } } = context;
 
-            const { data: comments } = await github.rest.issues.listComments({
-              owner,
-              repo,
-              issue_number: issueNumber
-            });
+              const COMMENT_TAG = '🧹 Code Analysis Report';
+              const fullBody = `${COMMENT_TAG}\n\n${summary}\n\n<sub>🤖 Generated by GitHub Actions</sub>`;
 
-            const existingComment = comments.find(comment =>
-              comment.body.includes(COMMENT_TAG) &&
-              comment.user.login === 'github-actions[bot]'
-            );
-
-            if (existingComment) {
-              await github.rest.issues.updateComment({
+              const { data: comments } = await github.rest.issues.listComments({
                 owner,
                 repo,
-                comment_id: existingComment.id,
-                body: fullBody
+                issue_number: issueNumber
               });
-            } else {
-              await github.rest.issues.createComment({
-                owner,
-                repo,
-                issue_number: issueNumber,
-                body: fullBody
-              });
+
+              const existingComment = comments.find(comment =>
+                comment.body.includes(COMMENT_TAG) &&
+                comment.user.login === 'github-actions[bot]'
+              );
+
+              if (existingComment) {
+                await github.rest.issues.updateComment({
+                  owner,
+                  repo,
+                  comment_id: existingComment.id,
+                  body: fullBody
+                });
+              } else {
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                  body: fullBody
+                });
+              }
+            } catch (error) {
+              console.error('Error posting comment:', error);
+              if (error.status === 403) {
+                console.warn('⚠️ Permission denied! Ensure workflow has "pull-requests: write" permission');
+              }
             }

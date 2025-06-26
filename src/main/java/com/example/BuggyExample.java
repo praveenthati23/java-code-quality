@@ -38,3 +38,4 @@ private void emptyCatch() {    // ❌ PMD: empty catch block
     }
 }
 }
+// Trigger test change

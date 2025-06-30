@@ -1,4 +1,4 @@
-name: PMD Code Analysis
+name: Code Analysis Report
 
 on:
   pull_request:
@@ -6,8 +6,8 @@ on:
       - dev
 
 jobs:
-  run-pmd:
-    name: Run PMD on PR to dev
+  static-analysis:
+    name: Run PMD, SpotBugs & Checkstyle
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
@@ -17,11 +17,11 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up JDK 17
+      - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
-          java-version: '17'
+          java-version: '21'
 
       - name: Cache Maven packages
         uses: actions/cache@v4
@@ -31,9 +31,8 @@ jobs:
           key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
           restore-keys: |
             ${{ runner.os }}-maven-
-
-      - name: Run PMD, SpotBugs analysis
-        run: mvn --batch-mode clean verify site
+      - name: Run PMD, SpotBugs & Checkstyle
+        run: mvn --batch-mode clean verify site -DskipTests
 
       - name: Install xmllint
         run: sudo apt-get install -y libxml2-utils
@@ -45,6 +44,8 @@ jobs:
           PMD_VIOLATIONS=0
           PMD_FILES=0
           SPOTBUGS_BUGS=0
+          CHECKSTYLE_ERRORS=0
+          CHECKSTYLE_FILES=0
           
           # Parse PMD report if exists
           if [ -f target/pmd.xml ]; then
@@ -56,6 +57,11 @@ jobs:
           if [ -f target/spotbugsXml.xml ]; then
             SPOTBUGS_BUGS=$(grep -o -E "total_bugs=['\"]?[0-9]+['\"]?" target/spotbugsXml.xml | head -1 | sed -E 's/[^0-9]//g')
             [ -z "$SPOTBUGS_BUGS" ] && SPOTBUGS_BUGS=0
+          fi
+          # Parse Checkstyle report if exists
+          if [ -f target/checkstyle-result.xml ]; then
+            CHECKSTYLE_ERRORS=$(grep -c '<error' target/checkstyle-result.xml || true)
+            CHECKSTYLE_FILES=$(grep -c '<file name=' target/checkstyle-result.xml || true)
           fi
           
           # Create markdown summary
@@ -72,9 +78,16 @@ jobs:
           # SpotBugs section
           SUMMARY+="  ### SpotBugs"
           if [ "$SPOTBUGS_BUGS" -eq "0" ]; then
-            SUMMARY+=" ✅ No bugs found\n\m"
+            SUMMARY+=" ✅ No bugs found\n\n"
           else
             SUMMARY+=" ❌ $SPOTBUGS_BUGS bugs found\n\n"
+          fi
+          # Checkstyle section
+          SUMMARY+="  ### Checkstyle"
+          if [ "$CHECKSTYLE_ERRORS" -eq "0" ]; then
+            SUMMARY+=" ✅ No violations found\n\n"
+          else
+            SUMMARY+=" ❌ $CHECKSTYLE_ERRORS violations in $CHECKSTYLE_FILES files\n\n"
           fi
           
           # Add download link
@@ -83,64 +96,58 @@ jobs:
           
           if [ "$PMD_VIOLATIONS" -gt "0" ]; then
             SUMMARY+=" <details><summary>PMD Violation Breakdown</summary>"
-            
-            # Use a simpler approach to parse PMD XML
-            # Extract file paths and count violations per file
             while IFS= read -r file_line; do
-              # Extract file path from <file name="path">
               file_path=$(echo "$file_line" | sed -n 's/.*<file name="\([^"]*\)".*/\1/p')
-              
               if [ -n "$file_path" ]; then
-                # Remove workspace prefix for cleaner display
                 clean_path="${file_path#$GITHUB_WORKSPACE/}"
-                
-                # Count violations for this file
                 violation_count=$(grep -c "<violation" <<< "$file_line" || echo "0")
-                
                 if [ "$violation_count" -gt 0 ]; then
                   SUMMARY+=" \`${clean_path} \`"
                 fi
               fi
             done < <(awk '/<file /{printf "%s", $0; next} /<\/file>/{print; next} {printf "%s", $0}' target/pmd.xml)
-            
             SUMMARY+=" </details>"
           fi
           
           if [ "$SPOTBUGS_BUGS" -gt "0" ]; then
             SUMMARY+=" <details><summary>SpotBugs Bug Breakdown</summary>"
-            
-            # Improved extraction of file paths and bug counts
             while IFS= read -r line; do
-              # Extract path value
               path="${line#*path=}"
               path="${path%% *}"
               path="${path#\'}"
               path="${path%\'}"
               path="${path#\"}"
               path="${path%\"}"
-              
-              # Extract bugCount value
               bugCount="${line#*bugCount=}"
               bugCount="${bugCount%% *}"
               bugCount="${bugCount#\'}"
               bugCount="${bugCount%\'}"
               bugCount="${bugCount#\"}"
               bugCount="${bugCount%\"}"
-              
               if [ -n "$path" ] && [ -n "$bugCount" ]; then
                 SUMMARY+=" \`${path} - ${bugCount} bugs\`\n"
               fi
             done < <(grep -o "FileStats [^>]*" target/spotbugsXml.xml)
-            
             SUMMARY+=" </details>"
           fi
-
+          if [ "$CHECKSTYLE_ERRORS" -gt "0" ]; then
+            SUMMARY+=" <details><summary>Checkstyle Violation Breakdown</summary>"
+            while IFS= read -r line; do
+              file_path=$(echo "$line" | sed -n 's/.*<file name="\([^"]*\)".*/\1/p')
+              if [ -n "$file_path" ]; then
+                clean_path="${file_path#$GITHUB_WORKSPACE/}"
+                error_count=$(awk -v f="$file_path" '$0 ~ f {c++} END {print c}' target/checkstyle-result.xml)
+                if [ "$error_count" -gt 0 ]; then
+                  SUMMARY+=" \`${clean_path} - ${error_count} issues\`\n"
+                fi
+              fi
+            done < <(grep -oP '<file name="[^"]+"' target/checkstyle-result.xml)
+            SUMMARY+=" </details>"
+          fi
           # Set output
           SUMMARY="${SUMMARY//\`/\\\`}"
           echo "summary=$SUMMARY" >> $GITHUB_OUTPUT
           echo "$summary"
-
-
       - name: Upload PMD report (HTML)
         if: always()
         uses: actions/upload-artifact@v4
@@ -154,6 +161,13 @@ jobs:
         with:
           name: spotbugs-report
           path: target/spotbugs.html
+
+      - name: Upload Checkstyle report (HTML)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkstyle-report
+          path: target/site/checkstyle.html
 
       - name: Post or update PR comment
         if: always() && github.event_name == 'pull_request'
